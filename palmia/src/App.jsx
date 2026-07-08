@@ -1147,7 +1147,7 @@ h1,h2,h3{font-family:'Cormorant Garamond',serif; letter-spacing:.2px; margin:0}
 
 /* main */
 .pf-main{min-width:0; padding:34px 40px 64px}
-.pf-view{max-width:1180px; margin:0 auto}
+.pf-view{max-width:none; margin:0}
 .pf-view-head{display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom:24px; flex-wrap:wrap}
 .pf-view-head h1{font-size:34px; font-weight:600}
 .pf-lead{margin:4px 0 0; color:var(--muted); font-size:14px}
