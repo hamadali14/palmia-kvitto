@@ -76,8 +76,8 @@ function writeLS(key, value) {
 /* Fyll i dina Supabase-uppgifter nedan. Med dem pa kravs inloggning och all data
    sparas sakert i molnet (en rad per forsaljning) och synkas mellan dina enheter.
    Lamnar du dem tomma anvands endast lokal lagring utan inloggning. */
-const SUPABASE_URL = "https://lxvtgcddboccaqzxayyf.supabase.co"
-const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx4dnRnY2RkYm9jY2FxenhheXlmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM1NDU5NTksImV4cCI6MjA5OTEyMTk1OX0.dzdS0gSwIODgJmmhqt3om3kWxB00ETK6_xVh7Vm4d6A"
+const SUPABASE_URL = ""; // t.ex. "https://xxxxxxxx.supabase.co"
+const SUPABASE_KEY = ""; // din "anon public"-nyckel
 const CLOUD_ON = Boolean(SUPABASE_URL && SUPABASE_KEY);
 
 let _sbClient = null;
@@ -898,43 +898,41 @@ function History({ sales, onExport, onDelete, onClear, onBackup }) {
           </div>
         </Card>
       ) : (
-        <Card>
-          <div className="pf-table-wrap">
-            <table className="pf-table pf-hist">
-              <thead>
-                <tr>
-                  <th className="l">Nummer</th>
-                  <th className="l">Datum</th>
-                  <th className="r">Enheter</th>
-                  <th className="r">Summa</th>
-                  <th className="r">Vinst</th>
-                  <th className="r">Atgard</th>
-                </tr>
-              </thead>
-              <tbody>
-                {sorted.map((s) => (
-                  <tr key={s.id}>
-                    <td className="l pf-mono">{s.number}</td>
-                    <td className="l">{prettyDate(s.date)}</td>
-                    <td className="r">{s.units}</td>
-                    <td className="r">{SEK(s.total)}</td>
-                    <td className="r pf-profit">{SEK(s.profit)}</td>
-                    <td className="r">
-                      <div className="pf-row-actions">
-                        <button className="pf-icon-btn" title="Ladda ner PDF" onClick={() => onExport(s)}>
-                          <FileDown size={16} />
-                        </button>
-                        <button className="pf-icon-btn pf-icon-danger" title="Radera" onClick={() => onDelete(s)}>
-                          <Trash2 size={16} />
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Card>
+        <div className="pf-hist-list">
+          {sorted.map((s) => (
+            <div className="pf-hist-item" key={s.id}>
+              <div className="pf-hist-id">
+                <span className="pf-mono">{s.number}</span>
+                <span className="pf-hist-date">
+                  {prettyDate(s.date)}
+                  {s._pending ? " · ej synkad" : ""}
+                </span>
+              </div>
+              <div className="pf-hist-figs">
+                <div>
+                  <span className="pf-hist-k">Enheter</span>
+                  <span className="pf-hist-v">{s.units}</span>
+                </div>
+                <div>
+                  <span className="pf-hist-k">Summa</span>
+                  <span className="pf-hist-v">{SEK(s.total)}</span>
+                </div>
+                <div>
+                  <span className="pf-hist-k">Vinst</span>
+                  <span className="pf-hist-v pf-profit">{SEK(s.profit)}</span>
+                </div>
+              </div>
+              <div className="pf-hist-act">
+                <button className="pf-icon-btn" title="Ladda ner PDF" onClick={() => onExport(s)}>
+                  <FileDown size={16} />
+                </button>
+                <button className="pf-icon-btn pf-icon-danger" title="Radera" onClick={() => onDelete(s)}>
+                  <Trash2 size={16} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );
@@ -1477,7 +1475,8 @@ const CSS = `
 }
 *{box-sizing:border-box}
 html,body,#root{height:100%}
-body{margin:0}
+html,body{background:#EFE6D6; overflow-x:hidden; width:100%}
+body{margin:0; -webkit-text-size-adjust:100%; text-size-adjust:100%}
 img,svg,table{max-width:100%}
 .pf-app{
   min-height:100vh; display:grid; grid-template-columns:246px minmax(0,1fr);
@@ -1571,6 +1570,22 @@ h1,h2,h3{font-family:'Cormorant Garamond',serif; letter-spacing:.2px; margin:0}
 .pf-recent-right{display:flex; align-items:center; gap:12px; flex:0 0 auto}
 .pf-recent-total{font-family:'Cormorant Garamond',serif; font-size:19px; font-weight:600}
 
+/* historik-kort */
+.pf-hist-list{display:flex; flex-direction:column; gap:12px}
+.pf-hist-item{
+  display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:18px; align-items:center;
+  padding:16px 18px; border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow);
+  background:linear-gradient(180deg, rgba(251,247,239,.92), rgba(250,244,234,.78));
+}
+.pf-hist-id{display:flex; flex-direction:column; gap:3px; min-width:0}
+.pf-hist-id .pf-mono{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.pf-hist-date{font-size:12px; color:var(--muted)}
+.pf-hist-figs{display:flex; gap:clamp(14px,2.4vw,26px)}
+.pf-hist-figs > div{display:flex; flex-direction:column; gap:2px; text-align:right; white-space:nowrap}
+.pf-hist-k{font-size:10px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted)}
+.pf-hist-v{font-size:15px; font-weight:500}
+.pf-hist-act{display:flex; gap:6px}
+
 /* empty */
 .pf-empty{display:flex; flex-direction:column; align-items:center; gap:8px; padding:34px 12px; text-align:center; color:var(--muted)}
 .pf-empty svg{color:var(--gold-deep); opacity:.7}
@@ -1594,9 +1609,10 @@ h1,h2,h3{font-family:'Cormorant Garamond',serif; letter-spacing:.2px; margin:0}
 .pf-sale-left{min-width:0}
 .pf-lbl{display:block; font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); margin-bottom:6px}
 .pf-lines{display:flex; flex-direction:column; gap:12px}
-.pf-line{display:grid; grid-template-columns:minmax(0,1fr) 128px 96px 110px 40px; gap:12px; align-items:end; padding-bottom:12px; border-bottom:1px solid var(--line-soft)}
+.pf-line{display:grid; grid-template-columns:minmax(120px,1.4fr) 1fr 1fr 44px; grid-template-areas:'pick pick pick pick' 'qty price sum del'; gap:12px; align-items:end; padding-bottom:14px; border-bottom:1px solid var(--line-soft)}
 .pf-line:last-child{border-bottom:none; padding-bottom:0}
 .pf-line > div{min-width:0}
+.pf-line-pick{grid-area:pick} .pf-line-qty{grid-area:qty} .pf-line-price{grid-area:price} .pf-line-sum{grid-area:sum} .pf-line-del{grid-area:del}
 .pf-line-static{padding:10px 12px; border-radius:11px; background:rgba(243,235,222,.6); border:1px solid var(--line-soft); font-size:14px; text-align:right; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 .pf-strong{font-weight:600; color:var(--ink)}
 .pf-line-del{width:100%; height:40px; display:grid; place-items:center; border-radius:10px; border:1px solid var(--line); background:transparent; color:var(--muted); cursor:pointer; transition:.15s}
@@ -1741,6 +1757,15 @@ h1,h2,h3{font-family:'Cormorant Garamond',serif; letter-spacing:.2px; margin:0}
   .pf-line{grid-template-columns:1fr 1fr; grid-template-areas:'pick pick' 'qty price' 'sum del'}
   .pf-line-pick{grid-area:pick} .pf-line-qty{grid-area:qty} .pf-line-price{grid-area:price}
   .pf-line-sum{grid-area:sum} .pf-line-del{grid-area:del}
+  /* 16px hindrar mobilen fran att auto-zooma nar man skriver */
+  .pf-input, .pf-picker-btn, .pf-picker-search input, .pf-stepper input, .pf-line-static{font-size:16px}
+}
+
+@media (max-width:640px){
+  .pf-hist-item{grid-template-columns:1fr auto; grid-template-areas:'id act' 'figs figs'; gap:12px}
+  .pf-hist-id{grid-area:id} .pf-hist-act{grid-area:act; align-self:start}
+  .pf-hist-figs{grid-area:figs; justify-content:space-between; gap:10px}
+  .pf-hist-figs > div{text-align:left}
 }
 
 @media (prefers-reduced-motion:reduce){*{transition:none !important}}
