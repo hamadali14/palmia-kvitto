@@ -76,8 +76,8 @@ function writeLS(key, value) {
 /* Fyll i dina Supabase-uppgifter nedan. Med dem pa kravs inloggning och all data
    sparas sakert i molnet (en rad per forsaljning) och synkas mellan dina enheter.
    Lamnar du dem tomma anvands endast lokal lagring utan inloggning. */
-const SUPABASE_URL = ""; // t.ex. "https://xxxxxxxx.supabase.co"
-const SUPABASE_KEY = ""; // din "anon public"-nyckel
+const SUPABASE_URL = "https://lxvtgcddboccaqzxayyf.supabase.co"
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx4dnRnY2RkYm9jY2FxenhheXlmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM1NDU5NTksImV4cCI6MjA5OTEyMTk1OX0.dzdS0gSwIODgJmmhqt3om3kWxB00ETK6_xVh7Vm4d6A"
 const CLOUD_ON = Boolean(SUPABASE_URL && SUPABASE_KEY);
 
 let _sbClient = null;
