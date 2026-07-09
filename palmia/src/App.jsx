@@ -28,32 +28,39 @@ import {
   X,
   Cloud,
   LogOut,
+  Coins,
+  Boxes,
 } from "lucide-react";
 
-/* ============================ produktkatalog ============================ */
-/* Fasta produkter. Pris = vad kunden betalar. Vinst = intern marginal. */
-const CATALOG = [
+/* ============================ produkter ============================ */
+/* Varje produkt: pris (vad kunden betalar) + keep (din andel av vinsten).
+   Skyldig till leverantoren = pris - keep. Bade pris och keep gar att andra. */
+const defaultProducts = () => [
   ...Array.from({ length: 20 }, (_, i) => ({
     id: `bb${i + 1}`,
     name: `Bundle Bundle ${i + 1}`,
-    price: 849,
-    profit: 500,
-    group: "Bundle Bundle",
+    price: 850,
+    keep: 500,
   })),
   ...Array.from({ length: 20 }, (_, i) => ({
     id: `b${i + 1}`,
     name: `Bundle ${i + 1}`,
-    price: 349,
-    profit: 249,
-    group: "Bundle",
+    price: 350,
+    keep: 250,
   })),
 ];
-const productById = (id) => CATALOG.find((p) => p.id === id) || null;
+/* modul-spegel sa rena funktioner (saleTotals, PDF) kan sla upp produkter */
+let PRODUCTS = defaultProducts();
+const setModuleProducts = (list) => {
+  if (Array.isArray(list) && list.length) PRODUCTS = list;
+};
+const productById = (id) => PRODUCTS.find((p) => p.id === id) || null;
 
 /* ============================ lagring ============================ */
 const LS = {
   sales: "palmia_sales",
   counter: "palmia_used_numbers",
+  products: "palmia_products",
 };
 function readLS(key, fallback) {
   try {
@@ -103,17 +110,22 @@ const saleToRow = (s) => ({
   profit: s.profit,
   units: s.units,
 });
-const rowToSale = (r) => ({
-  id: r.id,
-  number: r.number,
-  date: r.date,
-  method: r.method,
-  items: Array.isArray(r.items) ? r.items : [],
-  total: Number(r.total) || 0,
-  profit: Number(r.profit) || 0,
-  units: Number(r.units) || 0,
-  createdAt: r.created_at || new Date().toISOString(),
-});
+const rowToSale = (r) => {
+  const items = Array.isArray(r.items) ? r.items : [];
+  const t = saleTotals(items);
+  return {
+    id: r.id,
+    number: r.number,
+    date: r.date,
+    method: r.method,
+    items,
+    total: t.total,
+    profit: t.profit,
+    owe: t.owe,
+    units: t.units,
+    createdAt: r.created_at || new Date().toISOString(),
+  };
+};
 
 async function cloudFetchSales() {
   const sb = await getSb();
@@ -142,6 +154,34 @@ async function cloudDeleteAll() {
   if (!sb) return { error: "offline" };
   const { error } = await sb.from("sales").delete().neq("id", "___none___");
   return { error };
+}
+
+/* produkter i molnet (kraver en 'settings'-tabell; saknas den anvands lokalt) */
+async function cloudSaveProducts(products) {
+  const sb = await getSb();
+  if (!sb) return;
+  try {
+    await sb
+      .from("settings")
+      .upsert({ id: "products", data: products }, { onConflict: "user_id,id" });
+  } catch {
+    /* settings-tabell saknas - produkter sparas bara lokalt */
+  }
+}
+async function cloudLoadProducts() {
+  const sb = await getSb();
+  if (!sb) return null;
+  try {
+    const { data, error } = await sb
+      .from("settings")
+      .select("data")
+      .eq("id", "products")
+      .maybeSingle();
+    if (error) return null;
+    return data ? data.data : null;
+  } catch {
+    return null;
+  }
 }
 
 /* ============================ format & helpers ============================ */
@@ -187,20 +227,45 @@ function makeNumber(dateISO, used) {
   return `PALMIA-${y}-${Date.now().toString().slice(-4)}`;
 }
 
-/* summering av en forsaljning */
+/* per-rad: vinst = min(pris, keep), skyldig = max(0, pris - keep) */
+function lineCalc(unitPrice, keep, qty) {
+  const p = Math.max(0, num(unitPrice));
+  const k = Math.max(0, num(keep));
+  const q = Math.max(0, Math.floor(num(qty)));
+  return {
+    total: p * q,
+    profit: Math.min(p, k) * q,
+    owe: Math.max(0, p - k) * q,
+    units: q,
+  };
+}
+/* effektivt pris/keep for en rad (snapshot om det finns, annars produktens nuvarande) */
+function linePrice(it) {
+  if (it.unitPrice != null) return it.unitPrice;
+  const p = productById(it.productId);
+  return p ? p.price : 0;
+}
+function lineKeep(it) {
+  if (it.keep != null) return it.keep;
+  const p = productById(it.productId);
+  return p ? p.keep : 0;
+}
+
+/* summering av en forsaljning (fungerar for bade sparade snapshots och utkast) */
 function saleTotals(items) {
   let total = 0;
   let profit = 0;
+  let owe = 0;
   let units = 0;
   for (const it of items) {
-    const p = productById(it.productId);
-    if (!p) continue;
-    const q = Math.max(0, Math.floor(num(it.qty)));
-    total += p.price * q;
-    profit += p.profit * q;
-    units += q;
+    if (!it.productId) continue;
+    const c = lineCalc(linePrice(it), lineKeep(it), it.qty);
+    total += c.total;
+    profit += c.profit;
+    owe += c.owe;
+    units += c.units;
   }
-  return { total, profit, units };
+  return { total, profit, owe, units };
 }
 
 /* ============================ UI-kontext (toast + confirm) ============================ */
@@ -306,7 +371,7 @@ function Stepper({ value, onChange, min = 1 }) {
 }
 
 /* sokbar produktvaljare */
-function ProductPicker({ value, onPick }) {
+function ProductPicker({ value, onPick, products }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
   const wrap = useRef(null);
@@ -322,8 +387,8 @@ function ProductPicker({ value, onPick }) {
 
   const list = useMemo(() => {
     const s = q.trim().toLowerCase();
-    return CATALOG.filter((p) => !s || p.name.toLowerCase().includes(s));
-  }, [q]);
+    return (products || []).filter((p) => !s || p.name.toLowerCase().includes(s));
+  }, [q, products]);
 
   return (
     <div className="pf-picker" ref={wrap}>
@@ -375,8 +440,15 @@ function ProductPicker({ value, onPick }) {
 function PdfDocument({ sale }) {
   const t = saleTotals(sale.items);
   const rows = sale.items
-    .map((it) => ({ p: productById(it.productId), qty: Math.max(0, Math.floor(num(it.qty))) }))
-    .filter((r) => r.p && r.qty > 0);
+    .map((it) => {
+      const prod = productById(it.productId);
+      return {
+        name: it.name || (prod ? prod.name : "Produkt"),
+        price: linePrice(it),
+        qty: Math.max(0, Math.floor(num(it.qty))),
+      };
+    })
+    .filter((r) => r.qty > 0);
 
   return (
     <div className="pf-pdf">
@@ -406,10 +478,10 @@ function PdfDocument({ sale }) {
         <tbody>
           {rows.map((r, i) => (
             <tr key={i}>
-              <td className="l">{r.p.name}</td>
+              <td className="l">{r.name}</td>
               <td className="c">{r.qty}</td>
-              <td className="r">{SEK(r.p.price)}</td>
-              <td className="r">{SEK(r.p.price * r.qty)}</td>
+              <td className="r">{SEK(r.price)}</td>
+              <td className="r">{SEK(r.price * r.qty)}</td>
             </tr>
           ))}
           {rows.length === 0 && (
@@ -491,11 +563,15 @@ async function generatePdf(sale) {
     const faint = [240, 231, 216];
 
     const rows = sale.items
-      .map((it) => ({
-        p: productById(it.productId),
-        qty: Math.max(0, Math.floor(num(it.qty))),
-      }))
-      .filter((r) => r.p && r.qty > 0);
+      .map((it) => {
+        const prod = productById(it.productId);
+        return {
+          name: it.name || (prod ? prod.name : "Produkt"),
+          price: linePrice(it),
+          qty: Math.max(0, Math.floor(num(it.qty))),
+        };
+      })
+      .filter((r) => r.qty > 0);
     const t = saleTotals(sale.items);
 
     /* huvud */
@@ -553,11 +629,11 @@ async function generatePdf(sale) {
         doc.addPage();
         y = 28;
       }
-      const nameLines = doc.splitTextToSize(r.p.name, 80);
+      const nameLines = doc.splitTextToSize(r.name, 80);
       doc.text(nameLines, L, y);
       doc.text(String(r.qty), 128, y, { align: "right" });
-      doc.text(pdfKr(r.p.price), 160, y, { align: "right" });
-      doc.text(pdfKr(r.p.price * r.qty), R, y, { align: "right" });
+      doc.text(pdfKr(r.price), 160, y, { align: "right" });
+      doc.text(pdfKr(r.price * r.qty), R, y, { align: "right" });
       const h = Math.max(7, nameLines.length * 5);
       y += h;
       doc.setDrawColor(faint[0], faint[1], faint[2]);
@@ -608,9 +684,9 @@ async function generatePdf(sale) {
 }
 
 /* ============================ vyer ============================ */
-function StatCard({ icon: Icon, label, value, accent }) {
+function StatCard({ icon: Icon, label, value, accent, owe }) {
   return (
-    <div className={`pf-stat ${accent ? "pf-stat-accent" : ""}`}>
+    <div className={`pf-stat ${accent ? "pf-stat-accent" : ""} ${owe ? "pf-stat-owe" : ""}`}>
       <div className="pf-stat-ic">
         <Icon size={18} />
       </div>
@@ -626,26 +702,30 @@ function Dashboard({ sales, onExport, goNew }) {
   const agg = useMemo(() => {
     let revenue = 0;
     let profit = 0;
+    let owe = 0;
     let units = 0;
     const per = new Map();
     for (const s of sales) {
       revenue += s.total;
       profit += s.profit;
+      owe += s.owe || 0;
       for (const it of s.items) {
-        const p = productById(it.productId);
-        if (!p) continue;
-        const q = Math.max(0, Math.floor(num(it.qty)));
-        if (q <= 0) continue;
-        units += q;
-        const cur = per.get(p.id) || { name: p.name, units: 0, revenue: 0, profit: 0 };
-        cur.units += q;
-        cur.revenue += p.price * q;
-        cur.profit += p.profit * q;
-        per.set(p.id, cur);
+        if (!it.productId) continue;
+        const prod = productById(it.productId);
+        const name = it.name || (prod ? prod.name : it.productId);
+        const c = lineCalc(linePrice(it), lineKeep(it), it.qty);
+        if (c.units <= 0) continue;
+        units += c.units;
+        const cur = per.get(it.productId) || { name, units: 0, revenue: 0, profit: 0, owe: 0 };
+        cur.units += c.units;
+        cur.revenue += c.total;
+        cur.profit += c.profit;
+        cur.owe += c.owe;
+        per.set(it.productId, cur);
       }
     }
     const products = [...per.values()].sort((a, b) => b.units - a.units || b.profit - a.profit);
-    return { revenue, profit, units, products };
+    return { revenue, profit, owe, units, products };
   }, [sales]);
 
   const recent = useMemo(
@@ -658,7 +738,7 @@ function Dashboard({ sales, onExport, goNew }) {
       <div className="pf-view-head">
         <div>
           <h1>Oversikt</h1>
-          <p className="pf-lead">Din forsaljning och vinst, samlat.</p>
+          <p className="pf-lead">Din forsaljning, vinst och skuld — samlat.</p>
         </div>
         <Btn variant="primary" icon={Plus} onClick={goNew}>
           Ny forsaljning
@@ -668,7 +748,7 @@ function Dashboard({ sales, onExport, goNew }) {
       <div className="pf-stats">
         <StatCard icon={Wallet} label="Total forsaljning" value={SEK(agg.revenue)} />
         <StatCard icon={TrendingUp} label="Total vinst" value={SEK(agg.profit)} accent />
-        <StatCard icon={Receipt} label="Antal forsaljningar" value={sales.length} />
+        <StatCard icon={Coins} label="Skyldig totalt" value={SEK(agg.owe)} owe />
         <StatCard icon={ShoppingBag} label="Salda enheter" value={agg.units} />
       </div>
 
@@ -688,6 +768,7 @@ function Dashboard({ sales, onExport, goNew }) {
                     <th className="r">Salda</th>
                     <th className="r">Intakt</th>
                     <th className="r">Vinst</th>
+                    <th className="r">Skyldig</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -697,6 +778,7 @@ function Dashboard({ sales, onExport, goNew }) {
                       <td className="r">{p.units}</td>
                       <td className="r">{SEK(p.revenue)}</td>
                       <td className="r pf-profit">{SEK(p.profit)}</td>
+                      <td className="r pf-owe">{SEK(p.owe)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -735,7 +817,7 @@ function Dashboard({ sales, onExport, goNew }) {
   );
 }
 
-function NewSale({ draft, setDraft, onSave, onExportDraft }) {
+function NewSale({ draft, setDraft, onSave, onExportDraft, products }) {
   const t = saleTotals(draft.items);
 
   const setItem = (id, patch) =>
@@ -743,6 +825,10 @@ function NewSale({ draft, setDraft, onSave, onExportDraft }) {
       ...d,
       items: d.items.map((it) => (it.id === id ? { ...it, ...patch } : it)),
     }));
+  const pickProduct = (id, prodId) => {
+    const prod = products.find((x) => x.id === prodId);
+    setItem(id, { productId: prodId, unitPrice: prod ? prod.price : "" });
+  };
   const addItem = () =>
     setDraft((d) => ({ ...d, items: [...d.items, { id: uid(), productId: "", qty: 1 }] }));
   const removeItem = (id) =>
@@ -763,7 +849,9 @@ function NewSale({ draft, setDraft, onSave, onExportDraft }) {
       <div className="pf-view-head">
         <div>
           <h1>Ny forsaljning</h1>
-          <p className="pf-lead">Valj produkter — pris, nummer och datum fylls i automatiskt.</p>
+          <p className="pf-lead">
+            Valj produkt — pris fylls i men gar att andra. "100%" tar hela vinsten (inget skyldigt).
+          </p>
         </div>
       </div>
 
@@ -773,24 +861,47 @@ function NewSale({ draft, setDraft, onSave, onExportDraft }) {
             <div className="pf-lines">
               {draft.items.map((it) => {
                 const p = productById(it.productId);
-                const line = p ? p.price * Math.max(0, Math.floor(num(it.qty))) : 0;
+                const priceVal = it.unitPrice != null ? it.unitPrice : p ? p.price : "";
+                const c = p ? lineCalc(priceVal, p.keep, it.qty) : { total: 0, owe: 0 };
+                const isFull = p && num(priceVal) <= p.keep;
                 return (
                   <div className="pf-line" key={it.id}>
                     <div className="pf-line-pick">
                       <label className="pf-lbl">Produkt</label>
-                      <ProductPicker value={it.productId} onPick={(id) => setItem(it.id, { productId: id })} />
+                      <ProductPicker
+                        value={it.productId}
+                        products={products}
+                        onPick={(id) => pickProduct(it.id, id)}
+                      />
                     </div>
                     <div className="pf-line-qty">
                       <label className="pf-lbl">Antal</label>
                       <Stepper value={it.qty} onChange={(q) => setItem(it.id, { qty: q })} />
                     </div>
                     <div className="pf-line-price">
-                      <label className="pf-lbl">A-pris</label>
-                      <div className="pf-line-static">{p ? SEK(p.price) : "—"}</div>
+                      <label className="pf-lbl">A-pris (kr)</label>
+                      <div className="pf-price-wrap">
+                        <input
+                          className="pf-input pf-price-input"
+                          inputMode="numeric"
+                          disabled={!p}
+                          value={priceVal}
+                          onChange={(e) => setItem(it.id, { unitPrice: e.target.value })}
+                        />
+                        <button
+                          type="button"
+                          className={`pf-full-btn ${isFull ? "is-on" : ""}`}
+                          title="100% vinst - satt pris till din andel, inget skyldigt"
+                          disabled={!p}
+                          onClick={() => setItem(it.id, { unitPrice: p.keep })}
+                        >
+                          100%
+                        </button>
+                      </div>
                     </div>
                     <div className="pf-line-sum">
                       <label className="pf-lbl">Radtotal</label>
-                      <div className="pf-line-static pf-strong">{SEK(line)}</div>
+                      <div className="pf-line-static pf-strong">{SEK(c.total)}</div>
                     </div>
                     <button
                       className="pf-line-del"
@@ -847,6 +958,10 @@ function NewSale({ draft, setDraft, onSave, onExportDraft }) {
             <div className="pf-summary-row pf-summary-profit">
               <span>Din vinst (visas ej pa kvittot)</span>
               <span>{SEK(t.profit)}</span>
+            </div>
+            <div className="pf-summary-row pf-summary-owe">
+              <span>Skyldig leverantoren</span>
+              <span>{SEK(t.owe)}</span>
             </div>
             <div className="pf-summary-actions">
               <Btn variant="ghost" icon={FileDown} onClick={onExportDraft}>
@@ -921,6 +1036,10 @@ function History({ sales, onExport, onDelete, onClear, onBackup }) {
                   <span className="pf-hist-k">Vinst</span>
                   <span className="pf-hist-v pf-profit">{SEK(s.profit)}</span>
                 </div>
+                <div>
+                  <span className="pf-hist-k">Skyldig</span>
+                  <span className="pf-hist-v pf-owe">{SEK(s.owe || 0)}</span>
+                </div>
               </div>
               <div className="pf-hist-act">
                 <button className="pf-icon-btn" title="Ladda ner PDF" onClick={() => onExport(s)}>
@@ -938,11 +1057,94 @@ function History({ sales, onExport, onDelete, onClear, onBackup }) {
   );
 }
 
+/* ============================ produkter-sida ============================ */
+function Products({ products, onChange, sales }) {
+  const stats = useMemo(() => {
+    const m = new Map();
+    for (const s of sales) {
+      for (const it of s.items) {
+        if (!it.productId) continue;
+        const c = lineCalc(linePrice(it), lineKeep(it), it.qty);
+        const cur = m.get(it.productId) || { units: 0, profit: 0, owe: 0 };
+        cur.units += c.units;
+        cur.profit += c.profit;
+        cur.owe += c.owe;
+        m.set(it.productId, cur);
+      }
+    }
+    return m;
+  }, [sales]);
+
+  return (
+    <div className="pf-view">
+      <div className="pf-view-head">
+        <div>
+          <h1>Produkter</h1>
+          <p className="pf-lead">
+            Andra pris och din vinst-andel. Skyldig till leverantoren = pris minus din andel.
+          </p>
+        </div>
+      </div>
+
+      <div className="pf-prod-list">
+        {products.map((p) => {
+          const st = stats.get(p.id) || { units: 0, profit: 0, owe: 0 };
+          const cost = Math.max(0, num(p.price) - num(p.keep));
+          return (
+            <div className="pf-prod" key={p.id}>
+              <div className="pf-prod-name">{p.name}</div>
+              <div className="pf-prod-fields">
+                <label className="pf-prod-f">
+                  <span>Pris (kr)</span>
+                  <input
+                    className="pf-input"
+                    inputMode="numeric"
+                    value={p.price}
+                    onChange={(e) => onChange(p.id, { price: e.target.value })}
+                  />
+                </label>
+                <label className="pf-prod-f">
+                  <span>Din vinst (kr)</span>
+                  <input
+                    className="pf-input"
+                    inputMode="numeric"
+                    value={p.keep}
+                    onChange={(e) => onChange(p.id, { keep: e.target.value })}
+                  />
+                </label>
+                <div className="pf-prod-f">
+                  <span>Skyldig / st</span>
+                  <div className="pf-prod-static pf-owe">{SEK(cost)}</div>
+                </div>
+              </div>
+              <div className="pf-prod-stats">
+                <div>
+                  <span className="pf-hist-k">Salda</span>
+                  <span className="pf-hist-v">{st.units}</span>
+                </div>
+                <div>
+                  <span className="pf-hist-k">Vinst</span>
+                  <span className="pf-hist-v pf-profit">{SEK(st.profit)}</span>
+                </div>
+                <div>
+                  <span className="pf-hist-k">Skyldig</span>
+                  <span className="pf-hist-v pf-owe">{SEK(st.owe)}</span>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 /* ============================ rot ============================ */
 const NAV = [
   { key: "dashboard", label: "Oversikt", icon: LayoutDashboard },
   { key: "new", label: "Ny forsaljning", icon: Plus },
   { key: "history", label: "Historik", icon: Receipt },
+  { key: "products", label: "Produkter", icon: Boxes },
 ];
 
 function Shell({ onLogout }) {
@@ -950,6 +1152,10 @@ function Shell({ onLogout }) {
   const [view, setView] = useState("dashboard");
   const [menuOpen, setMenuOpen] = useState(false);
   const [sales, setSales] = useState(() => readLS(LS.sales, []));
+  const [products, setProducts] = useState(() => {
+    const saved = readLS(LS.products, null);
+    return Array.isArray(saved) && saved.length ? saved : defaultProducts();
+  });
   const [syncState, setSyncState] = useState(CLOUD_ON ? "syncing" : "local");
   const [draft, setDraft] = useState(() => ({
     number: "",
@@ -957,6 +1163,40 @@ function Shell({ onLogout }) {
     method: "Swish",
     items: [{ id: uid(), productId: "", qty: 1 }],
   }));
+
+  /* hall modul-spegeln i synk sa rena funktioner (saleTotals, PDF) ser ratt produkter */
+  setModuleProducts(products);
+
+  const prodReady = useRef(!CLOUD_ON);
+
+  /* ladda produkter fran molnet vid start (om det finns) */
+  useEffect(() => {
+    if (!CLOUD_ON) return;
+    let cancelled = false;
+    (async () => {
+      const remote = await cloudLoadProducts();
+      if (cancelled) return;
+      if (Array.isArray(remote) && remote.length) {
+        setProducts(remote);
+      } else {
+        cloudSaveProducts(readLS(LS.products, products));
+      }
+      prodReady.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /* spara produkter lokalt (direkt) + i molnet nar det ar laddat */
+  useEffect(() => {
+    writeLS(LS.products, products);
+    if (CLOUD_ON && prodReady.current) cloudSaveProducts(products);
+  }, [products]);
+
+  const updateProduct = useCallback((id, patch) => {
+    setProducts((list) => list.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  }, []);
 
   const salesRef = useRef(sales);
   useEffect(() => {
@@ -1067,9 +1307,20 @@ function Shell({ onLogout }) {
       method: draft.method,
       items: draft.items
         .filter((it) => productById(it.productId) && Math.floor(num(it.qty)) > 0)
-        .map((it) => ({ productId: it.productId, qty: Math.max(1, Math.floor(num(it.qty))) })),
+        .map((it) => {
+          const prod = productById(it.productId);
+          const unitPrice = it.unitPrice != null ? num(it.unitPrice) : num(prod.price);
+          return {
+            productId: it.productId,
+            name: prod.name,
+            qty: Math.max(1, Math.floor(num(it.qty))),
+            unitPrice,
+            keep: num(prod.keep),
+          };
+        }),
       total: t.total,
       profit: t.profit,
+      owe: t.owe,
       units: t.units,
       createdAt: new Date().toISOString(),
     };
@@ -1272,7 +1523,13 @@ function Shell({ onLogout }) {
           <Dashboard sales={sales} onExport={exportSale} goNew={() => setView("new")} />
         )}
         {view === "new" && (
-          <NewSale draft={draft} setDraft={setDraft} onSave={saveSale} onExportDraft={exportDraft} />
+          <NewSale
+            draft={draft}
+            setDraft={setDraft}
+            onSave={saveSale}
+            onExportDraft={exportDraft}
+            products={products}
+          />
         )}
         {view === "history" && (
           <History
@@ -1282,6 +1539,9 @@ function Shell({ onLogout }) {
             onClear={clearAll}
             onBackup={backup}
           />
+        )}
+        {view === "products" && (
+          <Products products={products} onChange={updateProduct} sales={sales} />
         )}
       </main>
     </div>
@@ -1470,7 +1730,7 @@ const CSS = `
 :root{
   --cream:#F1E9DB; --raised:#FBF7EF; --ink:#221D17; --muted:#7C7160;
   --line:#E2D8C7; --line-soft:#EDE4D5; --gold:#C99A3C; --gold-deep:#A87F2C;
-  --brown:#332A22; --brown-hi:#463A2E; --profit:#1C6B60; --danger:#B4472F;
+  --brown:#332A22; --brown-hi:#463A2E; --profit:#1C6B60; --danger:#B4472F; --owe:#B06A3B;
   --shadow:0 18px 44px -30px rgba(60,45,25,.55);
 }
 *{box-sizing:border-box}
@@ -1559,6 +1819,9 @@ h1,h2,h3{font-family:'Cormorant Garamond',serif; letter-spacing:.2px; margin:0}
 .pf-table .r{text-align:right; white-space:nowrap}
 .pf-table .c{text-align:center}
 .pf-profit{color:var(--profit); font-weight:500}
+.pf-owe{color:var(--owe); font-weight:500}
+.pf-stat-owe .pf-stat-ic{background:rgba(176,106,59,.14); color:var(--owe)}
+.pf-stat-owe .pf-stat-value{color:var(--owe)}
 
 /* recent */
 .pf-recent{list-style:none; margin:0; padding:0; display:flex; flex-direction:column}
@@ -1585,6 +1848,19 @@ h1,h2,h3{font-family:'Cormorant Garamond',serif; letter-spacing:.2px; margin:0}
 .pf-hist-k{font-size:10px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted)}
 .pf-hist-v{font-size:15px; font-weight:500}
 .pf-hist-act{display:flex; gap:6px}
+
+/* produkter-sida */
+.pf-prod-list{display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:14px}
+.pf-prod{border:1px solid var(--line); border-radius:16px; padding:16px 18px; box-shadow:var(--shadow); background:linear-gradient(180deg, rgba(251,247,239,.92), rgba(250,244,234,.78)); min-width:0}
+.pf-prod-name{font-family:'Cormorant Garamond',serif; font-size:19px; font-weight:600; margin-bottom:12px}
+.pf-prod-fields{display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; align-items:end}
+.pf-prod-f{display:flex; flex-direction:column; gap:5px; min-width:0}
+.pf-prod-f > span{font-size:10.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted)}
+.pf-prod-f .pf-input{text-align:right}
+.pf-prod-static{padding:10px 12px; border-radius:11px; background:rgba(243,235,222,.6); border:1px solid var(--line-soft); font-size:14px; text-align:right; white-space:nowrap}
+.pf-prod-stats{display:flex; gap:20px; margin-top:14px; padding-top:12px; border-top:1px solid var(--line-soft)}
+.pf-prod-stats > div{display:flex; flex-direction:column; gap:2px}
+.pf-prod-stats .pf-hist-v{font-size:15px}
 
 /* empty */
 .pf-empty{display:flex; flex-direction:column; align-items:center; gap:8px; padding:34px 12px; text-align:center; color:var(--muted)}
@@ -1657,6 +1933,14 @@ h1,h2,h3{font-family:'Cormorant Garamond',serif; letter-spacing:.2px; margin:0}
 .pf-summary-total{font-family:'Cormorant Garamond',serif; font-size:clamp(26px,3.4vw,30px); font-weight:600; color:var(--ink); white-space:nowrap}
 .pf-summary-profit{border-top:1px dashed var(--line); margin-top:6px; padding-top:10px; font-size:13.5px}
 .pf-summary-profit span:last-child{color:var(--profit); font-weight:500; white-space:nowrap}
+.pf-summary-owe{font-size:13.5px; padding-top:2px}
+.pf-summary-owe span:last-child{color:var(--owe); font-weight:500; white-space:nowrap}
+.pf-price-wrap{display:flex; gap:6px}
+.pf-price-input{flex:1; min-width:0; text-align:right}
+.pf-full-btn{flex:0 0 auto; padding:0 10px; border-radius:10px; border:1px solid var(--line); background:rgba(251,247,239,.8); color:var(--muted); font:inherit; font-size:12px; font-weight:500; cursor:pointer; transition:.15s}
+.pf-full-btn:hover:not(:disabled){border-color:var(--profit); color:var(--profit)}
+.pf-full-btn.is-on{background:var(--profit); border-color:var(--profit); color:#fff}
+.pf-full-btn:disabled{opacity:.5; cursor:not-allowed}
 .pf-summary-actions{display:flex; gap:10px; margin-top:14px; flex-wrap:wrap}
 .pf-summary-actions .pf-btn{flex:1 1 160px}
 
@@ -1731,12 +2015,12 @@ h1,h2,h3{font-family:'Cormorant Garamond',serif; letter-spacing:.2px; margin:0}
   .pf-app{grid-template-columns:minmax(0,1fr)}
   .pf-side{display:none}
   .pf-topbar{
-    display:flex; align-items:center; justify-content:space-between; gap:8px;
-    position:sticky; top:0; z-index:40; padding:10px clamp(12px,3vw,16px);
-    background:rgba(248,242,230,.96); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
-    border-bottom:1px solid var(--line);
+    display:flex; align-items:center; justify-content:flex-end; gap:8px;
+    position:sticky; top:0; z-index:40; padding:8px clamp(12px,3vw,16px);
+    background:rgba(239,230,214,.9); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
+    border-bottom:none;
   }
-  .pf-topbar .pf-logo-mark{display:block; font-size:23px}
+  .pf-topbar .pf-logo-mark{display:none}
   .pf-menu-btn{
     display:grid; place-items:center; width:42px; height:42px; border-radius:12px;
     border:1px solid var(--line); background:var(--raised); color:var(--ink); cursor:pointer;
