@@ -24,6 +24,10 @@ import {
   Sparkles,
   Download,
   AlertTriangle,
+  Menu,
+  X,
+  Cloud,
+  LogOut,
 } from "lucide-react";
 
 /* ============================ produktkatalog ============================ */
@@ -66,6 +70,78 @@ function writeLS(key, value) {
   } catch {
     /* lagring otillganglig */
   }
+}
+
+/* ============================ moln + inloggning (Supabase) ============================ */
+/* Fyll i dina Supabase-uppgifter nedan. Med dem pa kravs inloggning och all data
+   sparas sakert i molnet (en rad per forsaljning) och synkas mellan dina enheter.
+   Lamnar du dem tomma anvands endast lokal lagring utan inloggning. */
+const SUPABASE_URL = ""; // t.ex. "https://xxxxxxxx.supabase.co"
+const SUPABASE_KEY = ""; // din "anon public"-nyckel
+const CLOUD_ON = Boolean(SUPABASE_URL && SUPABASE_KEY);
+
+let _sbClient = null;
+async function getSb() {
+  if (!CLOUD_ON) return null;
+  if (_sbClient) return _sbClient;
+  const mod = await import(
+    /* @vite-ignore */ "https://esm.sh/@supabase/supabase-js@2"
+  );
+  const createClient = mod.createClient || (mod.default && mod.default.createClient);
+  _sbClient = createClient(SUPABASE_URL, SUPABASE_KEY);
+  return _sbClient;
+}
+
+/* mappning mellan app-objekt och databasrad */
+const saleToRow = (s) => ({
+  id: s.id,
+  number: s.number,
+  date: s.date,
+  method: s.method,
+  items: s.items,
+  total: s.total,
+  profit: s.profit,
+  units: s.units,
+});
+const rowToSale = (r) => ({
+  id: r.id,
+  number: r.number,
+  date: r.date,
+  method: r.method,
+  items: Array.isArray(r.items) ? r.items : [],
+  total: Number(r.total) || 0,
+  profit: Number(r.profit) || 0,
+  units: Number(r.units) || 0,
+  createdAt: r.created_at || new Date().toISOString(),
+});
+
+async function cloudFetchSales() {
+  const sb = await getSb();
+  if (!sb) return { error: "offline" };
+  const { data, error } = await sb
+    .from("sales")
+    .select("*")
+    .order("created_at", { ascending: false });
+  if (error) return { error };
+  return { data: (data || []).map(rowToSale) };
+}
+async function cloudInsertSale(sale) {
+  const sb = await getSb();
+  if (!sb) return { error: "offline" };
+  const { error } = await sb.from("sales").insert(saleToRow(sale));
+  return { error };
+}
+async function cloudDeleteSale(id) {
+  const sb = await getSb();
+  if (!sb) return { error: "offline" };
+  const { error } = await sb.from("sales").delete().eq("id", id);
+  return { error };
+}
+async function cloudDeleteAll() {
+  const sb = await getSb();
+  if (!sb) return { error: "offline" };
+  const { error } = await sb.from("sales").delete().neq("id", "___none___");
+  return { error };
 }
 
 /* ============================ format & helpers ============================ */
@@ -871,11 +947,12 @@ const NAV = [
   { key: "history", label: "Historik", icon: Receipt },
 ];
 
-function Shell() {
+function Shell({ onLogout }) {
   const { toast, confirm } = useUI();
   const [view, setView] = useState("dashboard");
+  const [menuOpen, setMenuOpen] = useState(false);
   const [sales, setSales] = useState(() => readLS(LS.sales, []));
-  const [used, setUsed] = useState(() => readLS(LS.counter, []));
+  const [syncState, setSyncState] = useState(CLOUD_ON ? "syncing" : "local");
   const [draft, setDraft] = useState(() => ({
     number: "",
     date: todayISO(),
@@ -883,21 +960,84 @@ function Shell() {
     items: [{ id: uid(), productId: "", qty: 1 }],
   }));
 
+  const salesRef = useRef(sales);
+  useEffect(() => {
+    salesRef.current = sales;
+  }, [sales]);
+  const flushing = useRef(false);
+
+  /* harled anvanda kvittonummer fran forsaljningarna (aldrig ur synk) */
+  const usedNumbers = useMemo(() => sales.map((s) => s.number), [sales]);
+
+  /* lokal cache (direkt, funkar offline) */
   useEffect(() => {
     writeLS(LS.sales, sales);
   }, [sales]);
+
+  /* skjut upp osynkade forsaljningar till molnet */
+  const flushPending = useCallback(async () => {
+    if (!CLOUD_ON || flushing.current) return;
+    flushing.current = true;
+    try {
+      const pend = salesRef.current.filter((s) => s._pending);
+      for (const s of pend) {
+        const clean = { ...s };
+        delete clean._pending;
+        const { error } = await cloudInsertSale(clean);
+        if (error) break; // fortfarande offline
+        setSales((cur) =>
+          cur.map((x) => (x.id === s.id ? { ...x, _pending: false } : x))
+        );
+      }
+      setSyncState("ok");
+    } catch {
+      setSyncState("offline");
+    } finally {
+      flushing.current = false;
+    }
+  }, []);
+
+  /* moln: hamta all data vid start (molnet ar sanningskallan) */
   useEffect(() => {
-    writeLS(LS.counter, used);
-  }, [used]);
+    if (!CLOUD_ON) return;
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await cloudFetchSales();
+      if (cancelled) return;
+      if (error) {
+        setSyncState("offline");
+        return;
+      }
+      setSales((local) => {
+        const cloudIds = new Set(data.map((s) => s.id));
+        const pending = local.filter((s) => s._pending && !cloudIds.has(s.id));
+        return [...pending, ...data].sort((a, b) =>
+          a.createdAt < b.createdAt ? 1 : -1
+        );
+      });
+      setSyncState("ok");
+      flushPending();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [flushPending]);
+
+  /* forsok synka osynkat med jamna mellanrum */
+  useEffect(() => {
+    if (!CLOUD_ON) return;
+    const id = setInterval(() => flushPending(), 15000);
+    return () => clearInterval(id);
+  }, [flushPending]);
 
   /* auto-nummer: satts nar det saknas eller nar aret andras */
   useEffect(() => {
     setDraft((d) => {
       const y = yearOf(d.date);
       if (d.number && d.number.startsWith(`PALMIA-${y}-`)) return d;
-      return { ...d, number: makeNumber(d.date, used) };
+      return { ...d, number: makeNumber(d.date, usedNumbers) };
     });
-  }, [draft.date, used]);
+  }, [draft.date, usedNumbers]);
 
   const exportSale = useCallback(
     async (sale) => {
@@ -919,7 +1059,9 @@ function Shell() {
       return;
     }
     const number =
-      draft.number && !used.includes(draft.number) ? draft.number : makeNumber(draft.date, used);
+      draft.number && !usedNumbers.includes(draft.number)
+        ? draft.number
+        : makeNumber(draft.date, usedNumbers);
     const sale = {
       id: uid(),
       number,
@@ -933,17 +1075,36 @@ function Shell() {
       units: t.units,
       createdAt: new Date().toISOString(),
     };
-    setSales((s) => [sale, ...s]);
-    setUsed((u) => [...u, number]);
-    setDraft({
-      number: "",
-      date: todayISO(),
-      method: draft.method,
-      items: [{ id: uid(), productId: "", qty: 1 }],
-    });
-    toast(`Forsaljning ${number} sparad.`, "ok");
-    setView("history");
-  }, [draft, used, toast]);
+    const resetDraft = () => {
+      setDraft({
+        number: "",
+        date: todayISO(),
+        method: draft.method,
+        items: [{ id: uid(), productId: "", qty: 1 }],
+      });
+      setView("history");
+    };
+
+    if (!CLOUD_ON) {
+      setSales((s) => [sale, ...s]);
+      resetDraft();
+      toast(`Forsaljning ${number} sparad.`, "ok");
+      return;
+    }
+
+    /* lagg till direkt (som osynkad), forsok spara i molnet */
+    setSales((s) => [{ ...sale, _pending: true }, ...s]);
+    resetDraft();
+    const { error } = await cloudInsertSale(sale);
+    if (!error) {
+      setSales((s) => s.map((x) => (x.id === sale.id ? { ...x, _pending: false } : x)));
+      setSyncState("ok");
+      toast(`Forsaljning ${number} sparad.`, "ok");
+    } else {
+      setSyncState("offline");
+      toast("Sparad lokalt - synkas nar internet ateransluter.", "warn");
+    }
+  }, [draft, usedNumbers, toast]);
 
   const exportDraft = useCallback(() => {
     const hasProduct = draft.items.some((it) => productById(it.productId));
@@ -952,12 +1113,12 @@ function Shell() {
       return;
     }
     exportSale({
-      number: draft.number || makeNumber(draft.date, used),
+      number: draft.number || makeNumber(draft.date, usedNumbers),
       date: draft.date,
       method: draft.method,
       items: draft.items,
     });
-  }, [draft, used, exportSale, toast]);
+  }, [draft, usedNumbers, exportSale, toast]);
 
   const deleteSale = useCallback(
     async (sale) => {
@@ -968,6 +1129,13 @@ function Shell() {
         danger: true,
       });
       if (!ok) return;
+      if (CLOUD_ON && !sale._pending) {
+        const { error } = await cloudDeleteSale(sale.id);
+        if (error) {
+          toast("Kunde inte radera nu - forsok igen nar du ar online.", "warn");
+          return;
+        }
+      }
       setSales((s) => s.filter((x) => x.id !== sale.id));
       toast("Forsaljning raderad.", "ok");
     },
@@ -977,19 +1145,27 @@ function Shell() {
   const clearAll = useCallback(async () => {
     const ok = await confirm({
       title: "Rensa all data?",
-      body: "Alla sparade forsaljningar raderas fran den har webblasaren. Detta gar inte att angra.",
+      body: CLOUD_ON
+        ? "Alla forsaljningar raderas fran ditt konto och alla enheter. Detta gar inte att angra."
+        : "Alla sparade forsaljningar raderas fran den har webblasaren. Detta gar inte att angra.",
       ok: "Rensa allt",
       danger: true,
     });
     if (!ok) return;
+    if (CLOUD_ON) {
+      const { error } = await cloudDeleteAll();
+      if (error) {
+        toast("Kunde inte rensa nu - forsok igen nar du ar online.", "warn");
+        return;
+      }
+    }
     setSales([]);
-    setUsed([]);
     toast("All data rensad.", "ok");
   }, [confirm, toast]);
 
   const backup = useCallback(() => {
     try {
-      const blob = new Blob([JSON.stringify({ sales, used }, null, 2)], {
+      const blob = new Blob([JSON.stringify({ sales }, null, 2)], {
         type: "application/json",
       });
       const url = URL.createObjectURL(blob);
@@ -1002,7 +1178,7 @@ function Shell() {
     } catch {
       toast("Kunde inte skapa kopia.", "warn");
     }
-  }, [sales, used, toast]);
+  }, [sales, toast]);
 
   return (
     <div className="pf-app">
@@ -1025,25 +1201,72 @@ function Shell() {
             </button>
           ))}
         </nav>
-        <div className="pf-side-foot">
-          <Sparkles size={13} />
-          <span>Data sparas lokalt i din webblasare.</span>
+        <div className="pf-side-foot-wrap">
+          <div className="pf-side-foot">
+            {CLOUD_ON ? <Cloud size={13} /> : <Sparkles size={13} />}
+            <span>
+              {!CLOUD_ON
+                ? "Data sparas lokalt i din webblasare."
+                : syncState === "offline"
+                ? "Offline - synkas nar internet finns."
+                : "Synkas mellan dina enheter."}
+            </span>
+          </div>
+          {onLogout && (
+            <button className="pf-logout" onClick={onLogout}>
+              <LogOut size={15} /> <span>Logga ut</span>
+            </button>
+          )}
         </div>
       </aside>
 
       <div className="pf-topbar">
         <span className="pf-logo-mark">Palmia</span>
-        <div className="pf-topnav">
-          {NAV.map((n) => (
-            <button
-              key={n.key}
-              className={`pf-tab ${view === (n.key === "new" ? "new" : n.key) ? "is-active" : ""}`}
-              onClick={() => setView(n.key === "new" ? "new" : n.key)}
-            >
-              {n.label}
-            </button>
-          ))}
-        </div>
+        <button
+          className="pf-menu-btn"
+          aria-label="Meny"
+          aria-expanded={menuOpen}
+          onClick={() => setMenuOpen((o) => !o)}
+        >
+          {menuOpen ? <X size={20} /> : <Menu size={20} />}
+        </button>
+        {menuOpen && (
+          <>
+            <div className="pf-menu-overlay" onClick={() => setMenuOpen(false)} />
+            <div className="pf-menu-panel" role="menu">
+              {NAV.map((n) => {
+                const key = n.key === "new" ? "new" : n.key;
+                return (
+                  <button
+                    key={n.key}
+                    role="menuitem"
+                    className={`pf-menu-item ${view === key ? "is-active" : ""}`}
+                    onClick={() => {
+                      setView(key);
+                      setMenuOpen(false);
+                    }}
+                  >
+                    <n.icon size={18} />
+                    <span>{n.label}</span>
+                  </button>
+                );
+              })}
+              {onLogout && (
+                <button
+                  role="menuitem"
+                  className="pf-menu-item"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onLogout();
+                  }}
+                >
+                  <LogOut size={18} />
+                  <span>Logga ut</span>
+                </button>
+              )}
+            </div>
+          </>
+        )}
       </div>
 
       <main className="pf-main">
@@ -1067,10 +1290,155 @@ function Shell() {
   );
 }
 
+/* ============================ inloggning ============================ */
+function Login() {
+  const [mode, setMode] = useState("in"); // in | up
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  const submit = async () => {
+    setMsg("");
+    if (!email || !pw) {
+      setMsg("Fyll i e-post och losenord.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const sb = await getSb();
+      if (!sb) {
+        setMsg("Ingen anslutning till servern.");
+        setBusy(false);
+        return;
+      }
+      const res =
+        mode === "in"
+          ? await sb.auth.signInWithPassword({ email, password: pw })
+          : await sb.auth.signUp({ email, password: pw });
+      if (res.error) {
+        setMsg(res.error.message || "Nagot gick fel.");
+      } else if (mode === "up" && !res.data.session) {
+        setMsg("Konto skapat. Kolla din e-post om bekraftelse kravs, logga sedan in.");
+        setMode("in");
+      }
+      /* vid lyckad inloggning byter Root vy automatiskt via onAuthStateChange */
+    } catch {
+      setMsg("Nagot gick fel. Forsok igen.");
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div className="pf-login">
+      <StyleInjector />
+      <div className="pf-login-card">
+        <div className="pf-login-brand">Palmia</div>
+        <div className="pf-login-sub">Forsaljning</div>
+        <p className="pf-login-lead">
+          {mode === "in" ? "Logga in for att se din forsaljning." : "Skapa ett konto."}
+        </p>
+        <label className="pf-lbl">E-post</label>
+        <input
+          className="pf-input"
+          type="email"
+          autoComplete="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+        />
+        <label className="pf-lbl" style={{ marginTop: 12 }}>
+          Losenord
+        </label>
+        <input
+          className="pf-input"
+          type="password"
+          autoComplete={mode === "in" ? "current-password" : "new-password"}
+          value={pw}
+          onChange={(e) => setPw(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+        />
+        {msg && <div className="pf-login-msg">{msg}</div>}
+        <button className="pf-btn pf-primary pf-login-btn" disabled={busy} onClick={submit}>
+          {busy ? "..." : mode === "in" ? "Logga in" : "Skapa konto"}
+        </button>
+        <button
+          className="pf-login-switch"
+          onClick={() => {
+            setMode((m) => (m === "in" ? "up" : "in"));
+            setMsg("");
+          }}
+        >
+          {mode === "in" ? "Har du inget konto? Skapa ett" : "Har du redan ett konto? Logga in"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================ rot med inloggnings-grind ============================ */
+function Root() {
+  const [phase, setPhase] = useState(CLOUD_ON ? "loading" : "local");
+
+  useEffect(() => {
+    if (!CLOUD_ON) return;
+    let cancelled = false;
+    let unsub = null;
+    (async () => {
+      let sb = null;
+      try {
+        sb = await getSb();
+      } catch {
+        sb = null;
+      }
+      if (cancelled) return;
+      if (!sb) {
+        setPhase("local"); // klarar sig utan moln om klienten inte kan laddas
+        return;
+      }
+      try {
+        const { data } = await sb.auth.getSession();
+        if (cancelled) return;
+        setPhase(data.session ? "in" : "out");
+        const sub = sb.auth.onAuthStateChange((_e, session) => {
+          setPhase(session ? "in" : "out");
+        });
+        unsub = () => sub.data.subscription.unsubscribe();
+      } catch {
+        if (!cancelled) setPhase("local");
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unsub) unsub();
+    };
+  }, []);
+
+  const logout = useCallback(async () => {
+    try {
+      const sb = await getSb();
+      if (sb) await sb.auth.signOut();
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  if (phase === "loading") {
+    return (
+      <div className="pf-splash">
+        <StyleInjector />
+        <div className="pf-splash-brand">Palmia</div>
+      </div>
+    );
+  }
+  if (phase === "out") return <Login />;
+  return <Shell onLogout={phase === "in" ? logout : null} />;
+}
+
 export default function App() {
   return (
     <UIProvider>
-      <Shell />
+      <Root />
     </UIProvider>
   );
 }
@@ -1141,7 +1509,10 @@ h1,h2,h3{font-family:'Cormorant Garamond',serif; letter-spacing:.2px; margin:0}
 }
 .pf-nav-btn:hover{background:rgba(201,154,60,.10); color:var(--ink)}
 .pf-nav-btn.is-active{background:var(--raised); color:var(--ink); box-shadow:inset 0 0 0 1px var(--line)}
-.pf-side-foot{margin-top:auto; display:flex; gap:8px; align-items:flex-start; color:var(--muted); font-size:11.5px; padding:0 8px; line-height:1.4}
+.pf-side-foot-wrap{margin-top:auto; display:flex; flex-direction:column; gap:10px}
+.pf-side-foot{display:flex; gap:8px; align-items:flex-start; color:var(--muted); font-size:11.5px; padding:0 8px; line-height:1.4}
+.pf-logout{display:flex; align-items:center; gap:8px; padding:9px 12px; border:1px solid var(--line); background:transparent; color:var(--muted); border-radius:10px; font:inherit; font-size:13px; cursor:pointer; transition:.15s}
+.pf-logout:hover{border-color:var(--danger); color:var(--danger)}
 
 /* topbar (mobil) */
 .pf-topbar{display:none}
@@ -1313,6 +1684,24 @@ h1,h2,h3{font-family:'Cormorant Garamond',serif; letter-spacing:.2px; margin:0}
 .pf-modal p{margin:0 0 18px; color:var(--muted); font-size:14px; line-height:1.5}
 .pf-modal-row{display:flex; gap:10px; justify-content:flex-end}
 
+/* inloggning + splash */
+.pf-splash{min-height:100vh; display:grid; place-items:center; background:linear-gradient(160deg,#F3EBDD 0%, #EFE6D6 100%)}
+.pf-splash-brand{font-family:'Cormorant Garamond',serif; font-weight:700; font-size:34px; color:var(--ink); opacity:.5}
+.pf-login{min-height:100vh; display:grid; place-items:center; padding:24px;
+  background:
+    radial-gradient(1100px 620px at 82% -8%, #FBF3E6 0%, rgba(251,243,230,0) 60%),
+    radial-gradient(900px 560px at 0% 108%, #F6EEDE 0%, rgba(246,238,222,0) 55%),
+    linear-gradient(160deg,#F3EBDD 0%, #EFE6D6 100%);
+  font-family:'Jost',system-ui,sans-serif; color:var(--ink)}
+.pf-login-card{width:100%; max-width:380px; background:linear-gradient(180deg, rgba(251,247,239,.95), rgba(250,244,234,.85)); border:1px solid var(--line); border-radius:20px; padding:clamp(24px,5vw,34px); box-shadow:var(--shadow)}
+.pf-login-brand{font-family:'Cormorant Garamond',serif; font-weight:700; font-size:34px; line-height:1}
+.pf-login-sub{font-size:11px; letter-spacing:.24em; text-transform:uppercase; color:var(--muted); margin-top:2px}
+.pf-login-lead{color:var(--muted); font-size:14px; margin:16px 0 20px}
+.pf-login-msg{margin-top:12px; font-size:13px; color:var(--danger); line-height:1.4}
+.pf-login-btn{width:100%; margin-top:18px; padding:12px}
+.pf-login-switch{width:100%; margin-top:12px; padding:8px; border:none; background:transparent; color:var(--gold-deep); font:inherit; font-size:13px; cursor:pointer}
+.pf-login-switch:hover{text-decoration:underline}
+
 /* ==== responsivt: fa, tydliga brytpunkter (grids ar redan flytande via auto-fit) ==== */
 
 /* preview forsvinner nar det blir trangt */
@@ -1321,23 +1710,34 @@ h1,h2,h3{font-family:'Cormorant Garamond',serif; letter-spacing:.2px; margin:0}
   .pf-sale-right{display:none}
 }
 
-/* sidomeny -> topbar */
+/* sidomeny -> topbar med hamburgermeny */
 @media (max-width:860px){
   .pf-app{grid-template-columns:minmax(0,1fr)}
   .pf-side{display:none}
   .pf-topbar{
-    display:flex; align-items:center; gap:8px; position:sticky; top:0; z-index:30;
-    padding:10px clamp(12px,3vw,16px); background:rgba(248,242,230,.94);
-    backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); border-bottom:1px solid var(--line);
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    position:sticky; top:0; z-index:40; padding:10px clamp(12px,3vw,16px);
+    background:rgba(248,242,230,.96); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--line);
   }
-  .pf-topbar .pf-logo-mark{display:none}
-  .pf-topnav{display:flex; flex:1; width:100%; gap:6px}
-  .pf-tab{
-    flex:1; min-width:0; text-align:center; padding:11px 4px; border:none; background:transparent;
-    color:var(--muted); border-radius:10px; font:inherit; font-size:clamp(12px,3.2vw,13.5px);
-    cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  .pf-topbar .pf-logo-mark{display:block; font-size:23px}
+  .pf-menu-btn{
+    display:grid; place-items:center; width:42px; height:42px; border-radius:12px;
+    border:1px solid var(--line); background:var(--raised); color:var(--ink); cursor:pointer;
   }
-  .pf-tab.is-active{background:var(--raised); color:var(--ink); box-shadow:inset 0 0 0 1px var(--line)}
+  .pf-menu-btn:hover{border-color:var(--gold); color:var(--gold-deep)}
+  .pf-menu-overlay{position:fixed; inset:0; z-index:38; background:rgba(40,32,22,.28)}
+  .pf-menu-panel{
+    position:absolute; z-index:39; top:calc(100% + 8px); right:clamp(12px,3vw,16px);
+    min-width:210px; background:var(--raised); border:1px solid var(--line); border-radius:16px;
+    box-shadow:0 26px 54px -24px rgba(60,45,25,.5); padding:8px; display:flex; flex-direction:column; gap:2px;
+  }
+  .pf-menu-item{
+    display:flex; align-items:center; gap:12px; padding:13px 14px; border:none; cursor:pointer;
+    background:transparent; color:var(--muted); border-radius:11px; font:inherit; font-size:15px; text-align:left;
+  }
+  .pf-menu-item:hover{background:rgba(201,154,60,.1); color:var(--ink)}
+  .pf-menu-item.is-active{background:var(--cream); color:var(--ink); box-shadow:inset 0 0 0 1px var(--line)}
   .pf-line{grid-template-columns:1fr 1fr; grid-template-areas:'pick pick' 'qty price' 'sum del'}
   .pf-line-pick{grid-area:pick} .pf-line-qty{grid-area:qty} .pf-line-price{grid-area:price}
   .pf-line-sum{grid-area:sum} .pf-line-del{grid-area:del}
